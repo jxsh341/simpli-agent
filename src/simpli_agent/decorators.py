@@ -7,6 +7,18 @@ import types
 from collections.abc import Mapping, Sequence
 from typing import Any, Callable, Dict, Union, get_args, get_origin, get_type_hints
 
+try:
+    from typing import Literal
+except ImportError:  # Python < 3.8
+    from typing_extensions import Literal
+
+try:
+    from pydantic import BaseModel
+    PYDANTIC_AVAILABLE = True
+except ImportError:
+    PYDANTIC_AVAILABLE = False
+    BaseModel = object  # type: ignore
+
 _JSON_TYPE_MAPPING: dict[Any, str] = {
     str: "string",
     int: "integer",
@@ -15,6 +27,25 @@ _JSON_TYPE_MAPPING: dict[Any, str] = {
     list: "array",
     dict: "object",
 }
+
+
+def _parse_param_docstring(doc: str) -> dict[str, str]:
+    """Extract parameter descriptions from Google/NumPy style docstrings."""
+    if not doc:
+        return {}
+    descriptions = {}
+    lines = doc.split("\n")
+    in_args = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped in ("Args:", "Arguments:", "Parameters:"):
+            in_args = True
+            continue
+        if in_args and stripped and not stripped.startswith(" "):
+            if ":" in stripped:
+                param, desc = stripped.split(":", 1)
+                descriptions[param.strip()] = desc.strip()
+    return descriptions
 
 
 def _annotation_to_schema(annotation: Any) -> Dict[str, Any]:
@@ -40,6 +71,12 @@ def _annotation_to_schema(annotation: Any) -> Dict[str, Any]:
     if origin in (dict, Mapping):
         return {"type": "object"}
 
+    if origin is Literal:
+        return {"type": "string", "enum": list(args)}
+
+    if PYDANTIC_AVAILABLE and isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation.model_json_schema()
+
     return {"type": _JSON_TYPE_MAPPING.get(annotation, "string")}
 
 
@@ -48,6 +85,7 @@ def generate_tool_schema(func: Callable[..., Any]) -> Dict[str, Any]:
     sig = inspect.signature(func)
     type_hints = get_type_hints(func)
     doc = inspect.getdoc(func) or "No description provided."
+    param_docs = _parse_param_docstring(doc)
 
     properties: dict[str, dict[str, Any]] = {}
     required: list[str] = []
@@ -61,7 +99,7 @@ def generate_tool_schema(func: Callable[..., Any]) -> Dict[str, Any]:
         param_type = type_hints.get(name, param.annotation)
         properties[name] = {
             **_annotation_to_schema(param_type),
-            "description": f"Parameter {name}",
+            "description": param_docs.get(name, f"Parameter {name}"),
         }
 
         if param.default is inspect.Parameter.empty:
@@ -71,7 +109,7 @@ def generate_tool_schema(func: Callable[..., Any]) -> Dict[str, Any]:
         "type": "function",
         "function": {
             "name": func.__name__,
-            "description": doc,
+            "description": doc.split("\n")[0] if doc else "No description provided.",
             "parameters": {
                 "type": "object",
                 "properties": properties,
