@@ -1,7 +1,7 @@
 """Public package exports for simpli-agent."""
 
 from .config import AgentConfig, load_config, create_agent_from_config
-from .core import Agent
+from .core import Agent, AsyncMiddleware, Middleware
 from .decorators import generate_tool_schema
 from .memory import SQLiteMemory
 from .semantic_memory import SemanticMemory, SQLITE_VEC_AVAILABLE
@@ -13,6 +13,17 @@ from .structured import (
     validate_output,
 )
 from .tracing import CallbackHandler, Tracer, get_tracer, traced
+from .middleware import (
+    logging_middleware,
+    timing_middleware,
+    retry_middleware,
+    cache_middleware,
+    rate_limit_middleware,
+    transform_args_middleware,
+    transform_result_middleware,
+    async_retry_middleware,
+    async_cache_middleware,
+)
 
 try:
     from .backends import OpenAIBackend, AnthropicBackend, OllamaBackend
@@ -23,6 +34,8 @@ except ImportError:
 
 __all__ = [
     "Agent",
+    "AsyncMiddleware",
+    "Middleware",
     "AgentConfig",
     "load_config",
     "create_agent_from_config",
@@ -39,6 +52,15 @@ __all__ = [
     "CallbackHandler",
     "get_tracer",
     "traced",
+    "logging_middleware",
+    "timing_middleware",
+    "retry_middleware",
+    "cache_middleware",
+    "rate_limit_middleware",
+    "transform_args_middleware",
+    "transform_result_middleware",
+    "async_retry_middleware",
+    "async_cache_middleware",
 ]
 if OpenAIBackend:
     __all__.append("OpenAIBackend")

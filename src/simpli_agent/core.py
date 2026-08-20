@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Callable
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Optional, TypeVar
 
 from .backends import (
     Backend,
@@ -52,6 +53,11 @@ class ToolResult:
     error: str | None = None
 
 
+# Middleware types
+Middleware = Callable[[ToolCall, Callable[[ToolCall], ToolResult]], ToolResult]
+AsyncMiddleware = Callable[[ToolCall, Callable[[ToolCall], Any]], Any]
+
+
 class Agent(AbstractContextManager):
     """Programmatic agent runtime with embedded SQLite state and tool schemas."""
 
@@ -83,6 +89,8 @@ class Agent(AbstractContextManager):
         self._checkpoints: list[dict[str, Any]] = []
         self._tracer = tracer or get_tracer()
         self._callbacks = CallbackHandler() if not isinstance(tracer, CallbackHandler) else tracer
+        self._middleware: list[Middleware] = []
+        self._async_middleware: list[AsyncMiddleware] = []
 
     def _resolve_backend(self, backend: str | Backend) -> Backend:
         if isinstance(backend, Backend):
@@ -92,6 +100,106 @@ class Agent(AbstractContextManager):
         except KeyError as exc:
             available = ", ".join(sorted(_BACKENDS))
             raise ValueError(f"Unknown backend '{backend}'. Available backends: {available}") from exc
+
+    # --- Middleware ---
+
+    def use(self, middleware: Middleware) -> "Agent":
+        """Add a synchronous middleware to the tool execution pipeline.
+
+        Middleware signature: (call: ToolCall, next: Callable) -> ToolResult
+
+        Example:
+            def logging_middleware(call, next):
+                print(f"Calling {call.name}")
+                result = next(call)
+                print(f"Result: {result.result}")
+                return result
+            agent.use(logging_middleware)
+        """
+        self._middleware.append(middleware)
+        return self
+
+    def use_async(self, middleware: AsyncMiddleware) -> "Agent":
+        """Add an asynchronous middleware to the tool execution pipeline.
+
+        Middleware signature: async (call: ToolCall, next: Callable) -> ToolResult
+        """
+        self._async_middleware.append(middleware)
+        return self
+
+    def _apply_middleware(self, call: ToolCall, executor: Callable[[ToolCall], ToolResult]) -> ToolResult:
+        """Apply middleware chain to tool execution."""
+        def run_chain(index: int, c: ToolCall) -> ToolResult:
+            if index >= len(self._middleware):
+                return executor(c)
+            return self._middleware[index](c, lambda next_call: run_chain(index + 1, next_call))
+        return run_chain(0, call)
+
+    async def _apply_middleware_async(self, call: ToolCall, executor: Callable[[ToolCall], Any]) -> ToolResult:
+        """Apply async middleware chain to tool execution."""
+        async def run_chain(index: int, c: ToolCall) -> ToolResult:
+            if index >= len(self._async_middleware):
+                return await executor(c)
+            return await self._async_middleware[index](c, lambda next_call: run_chain(index + 1, next_call))
+        return await run_chain(0, call)
+
+    # --- Serialization ---
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize agent state to a dictionary."""
+        return {
+            "model": self.model,
+            "system_prompt": self.system_prompt,
+            "parallel_tools": self.parallel_tools,
+            "max_turns": self.max_turns,
+            "backend_type": self.backend_type,
+            "tool_schemas": self.tool_schemas,
+            "tool_output_models": {k: v.__name__ for k, v in self.tool_output_models.items()},
+            "tool_confirm": self.tool_confirm,
+            "messages": self.memory.list_messages(),
+            "turn_count": self._turn_count,
+            "checkpoints": self._checkpoints,
+        }
+
+    def to_json(self) -> str:
+        """Serialize agent state to JSON string."""
+        return json.dumps(self.to_dict(), indent=2, default=str)
+
+    def save(self, path: str | Path) -> None:
+        """Save agent state to a JSON file."""
+        Path(path).write_text(self.to_json())
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], *, backend: str | Backend = "hermes", db_path: str | Path = ":memory:") -> "Agent":
+        """Create an agent from a serialized dictionary.
+
+        Note: Tools must be re-registered manually as they are not serializable.
+        """
+        agent = cls(
+            model=data.get("model", "gpt-4o"),
+            backend=backend,
+            db_path=db_path,
+            system_prompt=data.get("system_prompt"),
+            parallel_tools=data.get("parallel_tools", True),
+            max_turns=data.get("max_turns", 10),
+        )
+        agent.tool_schemas = data.get("tool_schemas", [])
+        agent.tool_output_models = {}  # Cannot restore type objects from names
+        agent.tool_confirm = data.get("tool_confirm", {})
+        agent._turn_count = data.get("turn_count", 0)
+        agent._checkpoints = data.get("checkpoints", [])
+
+        for msg in data.get("messages", []):
+            agent.memory.add_message(msg["role"], msg["content"])
+            if agent.semantic_memory:
+                agent.semantic_memory.add_message(msg["role"], msg["content"])
+        return agent
+
+    @classmethod
+    def load(cls, path: str | Path, *, backend: str | Backend = "hermes", db_path: str | Path = ":memory:") -> "Agent":
+        """Load agent state from a JSON file."""
+        data = json.loads(Path(path).read_text())
+        return cls.from_dict(data, backend=backend, db_path=db_path)
 
     def tool(
         self,
@@ -147,20 +255,23 @@ class Agent(AbstractContextManager):
                 self._callbacks.emit("on_tool_end", call.name, result, time.time() - start_time)
                 return result
 
-        try:
-            func = self.tools[call.name]
-            result_value = func(**call.arguments)
+        def execute(call: ToolCall) -> ToolResult:
+            try:
+                func = self.tools[call.name]
+                result_value = func(**call.arguments)
 
-            if call.name in self.tool_output_models and PYDANTIC_AVAILABLE:
-                result_value = parse_structured_output(self.tool_output_models[call.name], str(result_value))
+                if call.name in self.tool_output_models and PYDANTIC_AVAILABLE:
+                    result_value = parse_structured_output(self.tool_output_models[call.name], str(result_value))
 
-            result = ToolResult(call_id=call.call_id, name=call.name, result=result_value)
-            self._callbacks.emit("on_tool_end", call.name, result, time.time() - start_time)
-            return result
-        except Exception as e:
-            result = ToolResult(call_id=call.call_id, name=call.name, result=None, error=str(e))
-            self._callbacks.emit("on_tool_end", call.name, result, time.time() - start_time)
-            return result
+                result = ToolResult(call_id=call.call_id, name=call.name, result=result_value)
+                self._callbacks.emit("on_tool_end", call.name, result, time.time() - start_time)
+                return result
+            except Exception as e:
+                result = ToolResult(call_id=call.call_id, name=call.name, result=None, error=str(e))
+                self._callbacks.emit("on_tool_end", call.name, result, time.time() - start_time)
+                return result
+
+        return self._apply_middleware(call, execute)
 
     async def _execute_tool_async(self, call: ToolCall) -> ToolResult:
         """Execute a single tool call asynchronously."""
@@ -179,23 +290,26 @@ class Agent(AbstractContextManager):
                 self._callbacks.emit("on_tool_end", call.name, result, time.time() - start_time)
                 return result
 
-        try:
-            func = self.tools[call.name]
-            if inspect.iscoroutinefunction(func):
-                result_value = await func(**call.arguments)
-            else:
-                result_value = func(**call.arguments)
+        async def execute(call: ToolCall) -> ToolResult:
+            try:
+                func = self.tools[call.name]
+                if inspect.iscoroutinefunction(func):
+                    result_value = await func(**call.arguments)
+                else:
+                    result_value = func(**call.arguments)
 
-            if call.name in self.tool_output_models and PYDANTIC_AVAILABLE:
-                result_value = parse_structured_output(self.tool_output_models[call.name], str(result_value))
+                if call.name in self.tool_output_models and PYDANTIC_AVAILABLE:
+                    result_value = parse_structured_output(self.tool_output_models[call.name], str(result_value))
 
-            result = ToolResult(call_id=call.call_id, name=call.name, result=result_value)
-            self._callbacks.emit("on_tool_end", call.name, result, time.time() - start_time)
-            return result
-        except Exception as e:
-            result = ToolResult(call_id=call.call_id, name=call.name, result=None, error=str(e))
-            self._callbacks.emit("on_tool_end", call.name, result, time.time() - start_time)
-            return result
+                result = ToolResult(call_id=call.call_id, name=call.name, result=result_value)
+                self._callbacks.emit("on_tool_end", call.name, result, time.time() - start_time)
+                return result
+            except Exception as e:
+                result = ToolResult(call_id=call.call_id, name=call.name, result=None, error=str(e))
+                self._callbacks.emit("on_tool_end", call.name, result, time.time() - start_time)
+                return result
+
+        return await self._apply_middleware_async(call, execute)
 
     def _execute_tools(self, calls: list[ToolCall]) -> list[ToolResult]:
         """Execute multiple tool calls, optionally in parallel."""
@@ -473,6 +587,8 @@ class Agent(AbstractContextManager):
         new_agent.tool_schemas = self.tool_schemas.copy()
         new_agent.tool_output_models = self.tool_output_models.copy()
         new_agent.tool_confirm = self.tool_confirm.copy()
+        new_agent._middleware = self._middleware.copy()
+        new_agent._async_middleware = self._async_middleware.copy()
         return new_agent
 
     def close(self) -> None:
