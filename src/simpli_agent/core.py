@@ -19,6 +19,7 @@ from .backends import (
     AnthropicBackend,
     OllamaBackend,
 )
+from .costs import CostTracker, estimate_tokens
 from .decorators import generate_tool_schema
 from .memory import SQLiteMemory
 from .semantic_memory import SemanticMemory
@@ -72,6 +73,7 @@ class Agent(AbstractContextManager):
         semantic_memory: bool = False,
         embed_func: Optional[callable] = None,
         tracer: Tracer | CallbackHandler | None = None,
+        cost_tracker: CostTracker | None = None,
     ) -> None:
         self.model = model
         self.system_prompt = system_prompt
@@ -91,6 +93,7 @@ class Agent(AbstractContextManager):
         self._callbacks = CallbackHandler() if not isinstance(tracer, CallbackHandler) else tracer
         self._middleware: list[Middleware] = []
         self._async_middleware: list[AsyncMiddleware] = []
+        self._cost_tracker = cost_tracker or CostTracker(model)
 
     def _resolve_backend(self, backend: str | Backend) -> Backend:
         if isinstance(backend, Backend):
@@ -474,6 +477,12 @@ class Agent(AbstractContextManager):
                 self.memory.add_message("assistant", result)
                 if self.semantic_memory:
                     self.semantic_memory.add_message("assistant", result)
+                # Track token usage (estimate)
+                prompt_text = "\n".join(m.get("content", "") for m in messages)
+                self._cost_tracker.add_usage(
+                    estimate_tokens(prompt_text),
+                    estimate_tokens(result),
+                )
             else:
                 self.memory.add_message("assistant", str(result))
                 if self.semantic_memory:
@@ -548,6 +557,19 @@ class Agent(AbstractContextManager):
             return self.semantic_memory.search(query, limit=limit, semantic=True, threshold=threshold)
         return self.memory.search(query, limit=limit)
 
+    @property
+    def cost(self) -> CostTracker:
+        """Access the cost tracker for this agent."""
+        return self._cost_tracker
+
+    def usage(self) -> dict[str, Any]:
+        """Return a summary of token usage and costs."""
+        return self._cost_tracker.summary()
+
+    def reset_costs(self) -> None:
+        """Reset the cost tracker."""
+        self._cost_tracker.reset()
+
     def checkpoint(self) -> int:
         """Create a checkpoint of current conversation state. Returns checkpoint ID."""
         checkpoint = {
@@ -578,6 +600,7 @@ class Agent(AbstractContextManager):
             parallel_tools=self.parallel_tools,
             max_turns=self.max_turns,
             semantic_memory=self.semantic_memory is not None,
+            cost_tracker=CostTracker(self.model),  # Fresh tracker for fork
         )
         for msg in self.memory.list_messages():
             new_agent.memory.add_message(msg["role"], msg["content"])

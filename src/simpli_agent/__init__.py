@@ -2,8 +2,10 @@
 
 from .config import AgentConfig, load_config, create_agent_from_config
 from .core import Agent, AsyncMiddleware, Middleware
+from .costs import CostTracker, TokenUsage, get_tracker, estimate_tokens
 from .decorators import generate_tool_schema
 from .memory import SQLiteMemory
+from .pipeline import Pipeline, ToolChain, pipe, compose, register_pipeline
 from .semantic_memory import SemanticMemory, SQLITE_VEC_AVAILABLE
 from .structured import (
     PYDANTIC_AVAILABLE,
@@ -61,6 +63,15 @@ __all__ = [
     "transform_result_middleware",
     "async_retry_middleware",
     "async_cache_middleware",
+    "CostTracker",
+    "TokenUsage",
+    "get_tracker",
+    "estimate_tokens",
+    "Pipeline",
+    "ToolChain",
+    "pipe",
+    "compose",
+    "register_pipeline",
 ]
 if OpenAIBackend:
     __all__.append("OpenAIBackend")
