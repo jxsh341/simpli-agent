@@ -3,6 +3,7 @@
 from .config import AgentConfig, load_config, create_agent_from_config
 from .core import Agent, AsyncMiddleware, Middleware
 from .costs import CostTracker, TokenUsage, get_tracker, estimate_tokens
+from .debug import DebugREPL, AgentDebugger, debug, debug_agent, Breakpoint
 from .decorators import generate_tool_schema
 from .eval import (
     TestCase,
@@ -126,6 +127,11 @@ __all__ = [
     "RESEARCH_TEMPLATE",
     "CODING_TEMPLATE",
     "ANALYSIS_TEMPLATE",
+    "DebugREPL",
+    "AgentDebugger",
+    "debug",
+    "debug_agent",
+    "Breakpoint",
 ]
 if OpenAIBackend:
     __all__.append("OpenAIBackend")
