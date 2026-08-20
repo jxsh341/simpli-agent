@@ -4,6 +4,15 @@ from .config import AgentConfig, load_config, create_agent_from_config
 from .core import Agent, AsyncMiddleware, Middleware
 from .costs import CostTracker, TokenUsage, get_tracker, estimate_tokens
 from .decorators import generate_tool_schema
+from .eval import (
+    TestCase,
+    TestResult,
+    EvaluationResult,
+    Evaluator,
+    evaluate,
+    evaluate_async,
+    benchmark,
+)
 from .memory import SQLiteMemory
 from .pipeline import Pipeline, ToolChain, pipe, compose, register_pipeline
 from .semantic_memory import SemanticMemory, SQLITE_VEC_AVAILABLE
@@ -72,6 +81,13 @@ __all__ = [
     "pipe",
     "compose",
     "register_pipeline",
+    "TestCase",
+    "TestResult",
+    "EvaluationResult",
+    "Evaluator",
+    "evaluate",
+    "evaluate_async",
+    "benchmark",
 ]
 if OpenAIBackend:
     __all__.append("OpenAIBackend")
