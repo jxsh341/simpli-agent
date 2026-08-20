@@ -35,6 +35,7 @@ from .middleware import (
     async_retry_middleware,
     async_cache_middleware,
 )
+from .types import ToolCall, ToolResult, ToolProgress
 
 try:
     from .backends import OpenAIBackend, AnthropicBackend, OllamaBackend
@@ -88,6 +89,9 @@ __all__ = [
     "evaluate",
     "evaluate_async",
     "benchmark",
+    "ToolCall",
+    "ToolResult",
+    "ToolProgress",
 ]
 if OpenAIBackend:
     __all__.append("OpenAIBackend")

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Mapping, Sequence
-from typing import Any, Callable
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from typing import Any, Callable, Union
 
 
 class Backend(ABC):
@@ -64,6 +64,28 @@ class Backend(ABC):
     ) -> dict[str, Any]:
         """Async version of run_with_tools."""
         raise NotImplementedError("run_with_tools_async not implemented")
+
+    def stream_with_tools(
+        self,
+        *,
+        model: str,
+        messages: Sequence[dict[str, Any]],
+        tools: Mapping[str, Callable[..., Any]],
+        schemas: Sequence[dict[str, Any]],
+    ) -> Iterator[Union[str, Any]]:
+        """Stream response with tool progress. Optional override."""
+        raise NotImplementedError("stream_with_tools not implemented")
+
+    async def stream_with_tools_async(
+        self,
+        *,
+        model: str,
+        messages: Sequence[dict[str, Any]],
+        tools: Mapping[str, Callable[..., Any]],
+        schemas: Sequence[dict[str, Any]],
+    ) -> AsyncIterator[Union[str, Any]]:
+        """Async stream response with tool progress. Optional override."""
+        raise NotImplementedError("stream_with_tools_async not implemented")
 
     async def stream_async(
         self,

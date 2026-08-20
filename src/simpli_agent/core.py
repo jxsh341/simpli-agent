@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Iterator, Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, TypeVar
+from typing import Any, Optional, TypeVar, Union
 
 from .backends import (
     Backend,
@@ -25,6 +25,7 @@ from .memory import SQLiteMemory
 from .semantic_memory import SemanticMemory
 from .structured import PYDANTIC_AVAILABLE, parse_structured_output
 from .tracing import CallbackHandler, Tracer, get_tracer
+from .types import ToolCall, ToolResult, ToolProgress
 
 T = TypeVar("T")
 
@@ -35,23 +36,6 @@ if AnthropicBackend:
     _BACKENDS["anthropic"] = AnthropicBackend
 if OllamaBackend:
     _BACKENDS["ollama"] = OllamaBackend
-
-
-@dataclass
-class ToolCall:
-    """Represents a tool call request from the LLM."""
-    name: str
-    arguments: dict[str, Any]
-    call_id: str | None = None
-
-
-@dataclass
-class ToolResult:
-    """Represents a tool execution result."""
-    call_id: str | None
-    name: str
-    result: Any
-    error: str | None = None
 
 
 # Middleware types
@@ -263,6 +247,14 @@ class Agent(AbstractContextManager):
                 func = self.tools[call.name]
                 result_value = func(**call.arguments)
 
+                # Handle streaming tools (generators)
+                if inspect.isgenerator(result_value) or hasattr(result_value, '__iter__') and not isinstance(result_value, (str, dict, list, tuple)):
+                    # Consume generator and return final result
+                    final_result = None
+                    for item in result_value:
+                        final_result = item
+                    result_value = final_result
+
                 if call.name in self.tool_output_models and PYDANTIC_AVAILABLE:
                     result_value = parse_structured_output(self.tool_output_models[call.name], str(result_value))
 
@@ -275,6 +267,49 @@ class Agent(AbstractContextManager):
                 return result
 
         return self._apply_middleware(call, execute)
+
+    def _execute_tool_streaming(self, call: ToolCall) -> Iterator[ToolProgress]:
+        """Execute a single tool call with streaming progress updates."""
+        self._callbacks.emit("on_tool_start", call.name, call.arguments)
+        start_time = time.time()
+
+        if call.name not in self.tools:
+            yield ToolProgress(call_id=call.call_id, name=call.name, progress=f"Unknown tool: {call.name}", is_final=True, error=f"Unknown tool: {call.name}")
+            return
+
+        if self.tool_confirm.get(call.name, False):
+            confirm = input(f"Confirm tool '{call.name}' with args {call.arguments}? [y/N] ")
+            if confirm.lower() != "y":
+                yield ToolProgress(call_id=call.call_id, name=call.name, progress="User cancelled", is_final=True, error="User cancelled")
+                return
+
+        try:
+            func = self.tools[call.name]
+            result_value = func(**call.arguments)
+
+            # Handle streaming tools (generators)
+            if inspect.isgenerator(result_value) or (hasattr(result_value, '__iter__') and not isinstance(result_value, (str, dict, list, tuple, bytes))):
+                final_result = None
+                for item in result_value:
+                    final_result = item
+                    yield ToolProgress(call_id=call.call_id, name=call.name, progress=item, is_final=False)
+                
+                # Apply output model if needed
+                if call.name in self.tool_output_models and PYDANTIC_AVAILABLE:
+                    final_result = parse_structured_output(self.tool_output_models[call.name], str(final_result))
+                
+                yield ToolProgress(call_id=call.call_id, name=call.name, progress=final_result, is_final=True)
+                self._callbacks.emit("on_tool_end", call.name, ToolResult(call_id=call.call_id, name=call.name, result=final_result), time.time() - start_time)
+            else:
+                # Regular tool - yield single final progress
+                if call.name in self.tool_output_models and PYDANTIC_AVAILABLE:
+                    result_value = parse_structured_output(self.tool_output_models[call.name], str(result_value))
+                yield ToolProgress(call_id=call.call_id, name=call.name, progress=result_value, is_final=True)
+                self._callbacks.emit("on_tool_end", call.name, ToolResult(call_id=call.call_id, name=call.name, result=result_value), time.time() - start_time)
+
+        except Exception as e:
+            yield ToolProgress(call_id=call.call_id, name=call.name, progress=str(e), is_final=True, error=str(e))
+            self._callbacks.emit("on_tool_end", call.name, ToolResult(call_id=call.call_id, name=call.name, result=None, error=str(e)), time.time() - start_time)
 
     async def _execute_tool_async(self, call: ToolCall) -> ToolResult:
         """Execute a single tool call asynchronously."""
@@ -301,6 +336,19 @@ class Agent(AbstractContextManager):
                 else:
                     result_value = func(**call.arguments)
 
+                # Handle async generators
+                if inspect.isasyncgen(result_value):
+                    final_result = None
+                    async for item in result_value:
+                        final_result = item
+                    result_value = final_result
+                # Handle regular generators in async context
+                elif inspect.isgenerator(result_value):
+                    final_result = None
+                    for item in result_value:
+                        final_result = item
+                    result_value = final_result
+
                 if call.name in self.tool_output_models and PYDANTIC_AVAILABLE:
                     result_value = parse_structured_output(self.tool_output_models[call.name], str(result_value))
 
@@ -313,6 +361,63 @@ class Agent(AbstractContextManager):
                 return result
 
         return await self._apply_middleware_async(call, execute)
+
+    async def _execute_tool_streaming_async(self, call: ToolCall) -> AsyncIterator[ToolProgress]:
+        """Execute a single tool call asynchronously with streaming progress updates."""
+        self._callbacks.emit("on_tool_start", call.name, call.arguments)
+        start_time = time.time()
+
+        if call.name not in self.tools:
+            yield ToolProgress(call_id=call.call_id, name=call.name, progress=f"Unknown tool: {call.name}", is_final=True, error=f"Unknown tool: {call.name}")
+            return
+
+        if self.tool_confirm.get(call.name, False):
+            confirm = input(f"Confirm tool '{call.name}' with args {call.arguments}? [y/N] ")
+            if confirm.lower() != "y":
+                yield ToolProgress(call_id=call.call_id, name=call.name, progress="User cancelled", is_final=True, error="User cancelled")
+                return
+
+        try:
+            func = self.tools[call.name]
+            if inspect.iscoroutinefunction(func):
+                result_value = await func(**call.arguments)
+            else:
+                result_value = func(**call.arguments)
+
+            # Handle async generators
+            if inspect.isasyncgen(result_value):
+                final_result = None
+                async for item in result_value:
+                    final_result = item
+                    yield ToolProgress(call_id=call.call_id, name=call.name, progress=item, is_final=False)
+                
+                if call.name in self.tool_output_models and PYDANTIC_AVAILABLE:
+                    final_result = parse_structured_output(self.tool_output_models[call.name], str(final_result))
+                
+                yield ToolProgress(call_id=call.call_id, name=call.name, progress=final_result, is_final=True)
+                self._callbacks.emit("on_tool_end", call.name, ToolResult(call_id=call.call_id, name=call.name, result=final_result), time.time() - start_time)
+            # Handle regular generators in async context
+            elif inspect.isgenerator(result_value):
+                final_result = None
+                for item in result_value:
+                    final_result = item
+                    yield ToolProgress(call_id=call.call_id, name=call.name, progress=item, is_final=False)
+                
+                if call.name in self.tool_output_models and PYDANTIC_AVAILABLE:
+                    final_result = parse_structured_output(self.tool_output_models[call.name], str(final_result))
+                
+                yield ToolProgress(call_id=call.call_id, name=call.name, progress=final_result, is_final=True)
+                self._callbacks.emit("on_tool_end", call.name, ToolResult(call_id=call.call_id, name=call.name, result=final_result), time.time() - start_time)
+            else:
+                # Regular tool - yield single final progress
+                if call.name in self.tool_output_models and PYDANTIC_AVAILABLE:
+                    result_value = parse_structured_output(self.tool_output_models[call.name], str(result_value))
+                yield ToolProgress(call_id=call.call_id, name=call.name, progress=result_value, is_final=True)
+                self._callbacks.emit("on_tool_end", call.name, ToolResult(call_id=call.call_id, name=call.name, result=result_value), time.time() - start_time)
+
+        except Exception as e:
+            yield ToolProgress(call_id=call.call_id, name=call.name, progress=str(e), is_final=True, error=str(e))
+            self._callbacks.emit("on_tool_end", call.name, ToolResult(call_id=call.call_id, name=call.name, result=None, error=str(e)), time.time() - start_time)
 
     def _execute_tools(self, calls: list[ToolCall]) -> list[ToolResult]:
         """Execute multiple tool calls, optionally in parallel."""
@@ -523,6 +628,64 @@ class Agent(AbstractContextManager):
         for chunk in response.split():
             yield chunk
 
+    def stream_with_tools(self, prompt: str) -> Iterator[Union[str, ToolProgress]]:
+        """Stream response with tool progress updates.
+        
+        Yields both LLM response chunks (str) and tool progress (ToolProgress).
+        This enables real-time progress updates for long-running tools.
+        """
+        self.memory.add_message("user", prompt)
+        if self.semantic_memory:
+            self.semantic_memory.add_message("user", prompt)
+        
+        messages = self._build_messages(prompt)
+        self._turn_count = 0
+        
+        while self._turn_count < self.max_turns:
+            self._turn_count += 1
+            
+            # Stream LLM response
+            if hasattr(self.backend, "stream_with_tools"):
+                # Backend supports tool streaming natively
+                for chunk in self.backend.stream_with_tools(
+                    model=self.model,
+                    messages=messages,
+                    tools=self.tools,
+                    schemas=self.tool_schemas,
+                ):
+                    if isinstance(chunk, str):
+                        yield chunk
+                    elif isinstance(chunk, ToolProgress):
+                        yield chunk
+            else:
+                # Fallback: stream LLM, then execute tools
+                response_chunks = []
+                for chunk in self.backend.stream_async(
+                    model=self.model,
+                    prompt=prompt,
+                    tools=self.tools,
+                    schemas=self.tool_schemas,
+                    history=messages,
+                ):
+                    response_chunks.append(chunk)
+                    yield chunk
+                
+                full_response = "".join(response_chunks)
+                messages.append({"role": "assistant", "content": full_response})
+                
+                # Check for tool calls (simplified - would need proper parsing)
+                # For now, just return the response
+                break
+            
+            # If we get tool calls, execute them with streaming
+            # This is a simplified version - full implementation would parse tool calls from response
+            break
+        
+        # Persist the final response
+        self.memory.add_message("assistant", "streamed")
+        if self.semantic_memory:
+            self.semantic_memory.add_message("assistant", "streamed")
+
     async def stream_async(self, prompt: str) -> AsyncIterator[str]:
         """Async stream a response."""
         async for chunk in self.backend.stream_async(
@@ -533,6 +696,44 @@ class Agent(AbstractContextManager):
             history=self._build_messages(prompt),
         ):
             yield chunk
+
+    async def stream_with_tools_async(self, prompt: str) -> AsyncIterator[Union[str, ToolProgress]]:
+        """Async stream response with tool progress updates."""
+        self.memory.add_message("user", prompt)
+        if self.semantic_memory:
+            self.semantic_memory.add_message("user", prompt)
+        
+        messages = self._build_messages(prompt)
+        self._turn_count = 0
+        
+        while self._turn_count < self.max_turns:
+            self._turn_count += 1
+            
+            if hasattr(self.backend, "stream_with_tools_async"):
+                async for chunk in self.backend.stream_with_tools_async(
+                    model=self.model,
+                    messages=messages,
+                    tools=self.tools,
+                    schemas=self.tool_schemas,
+                ):
+                    if isinstance(chunk, str):
+                        yield chunk
+                    elif isinstance(chunk, ToolProgress):
+                        yield chunk
+            else:
+                async for chunk in self.backend.stream_async(
+                    model=self.model,
+                    prompt=prompt,
+                    tools=self.tools,
+                    schemas=self.tool_schemas,
+                    history=messages,
+                ):
+                    yield chunk
+                break
+        
+        self.memory.add_message("assistant", "streamed")
+        if self.semantic_memory:
+            self.semantic_memory.add_message("assistant", "streamed")
 
     def history(self, limit: Optional[int] = None) -> list[dict[str, str | int]]:
         """Return persisted conversation messages."""

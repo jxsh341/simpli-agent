@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator
+from typing import Any, Callable, Mapping, Sequence, Union
 
+from ..types import ToolProgress
 from .base import Backend
 
 
@@ -64,5 +66,33 @@ class HermesBackend(Backend):
         history: Sequence[dict[str, Any]],
     ):
         response = self.run(model=model, prompt=prompt, tools=tools, schemas=schemas, history=history)
+        for chunk in response.split():
+            yield chunk + " "
+
+    def stream_with_tools(
+        self,
+        *,
+        model: str,
+        messages: Sequence[dict[str, Any]],
+        tools: Mapping[str, Callable[..., Any]],
+        schemas: Sequence[dict[str, Any]],
+    ) -> Iterator[Union[str, ToolProgress]]:
+        """Stream response with tool progress (Hermes placeholder)."""
+        tool_summary = f" with {len(schemas)} tool(s)" if schemas else ""
+        response = f"[Simpli-Agent Response using {model}{tool_summary}] Completed task"
+        for chunk in response.split():
+            yield chunk + " "
+
+    async def stream_with_tools_async(
+        self,
+        *,
+        model: str,
+        messages: Sequence[dict[str, Any]],
+        tools: Mapping[str, Callable[..., Any]],
+        schemas: Sequence[dict[str, Any]],
+    ) -> AsyncIterator[Union[str, ToolProgress]]:
+        """Async stream response with tool progress (Hermes placeholder)."""
+        tool_summary = f" with {len(schemas)} tool(s)" if schemas else ""
+        response = f"[Simpli-Agent Response using {model}{tool_summary}] Completed task"
         for chunk in response.split():
             yield chunk + " "
